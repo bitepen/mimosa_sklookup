@@ -14,7 +14,7 @@ sklookup.skel.h: sklookup.bpf.o
 	$(BPFTOOL) gen skeleton sklookup.bpf.o > sklookup.skel.h
 
 sklookup: sklookup.c sklookup.skel.h
-	$(CC) -O2 -static sklookup.c -o sklookup -lbpf -lelf -lz -lzstd
+	$(CC) -O2 -Wall -Wextra -static sklookup.c -o sklookup -lbpf -lelf -lz -lzstd
 
 clean:
 	rm -f sklookup sklookup.bpf.o sklookup.skel.h vmlinux.h

@@ -98,23 +98,53 @@ static int get_mihomo_socket_fd(int pid, int target_port, int target_type)
     return target_sock;
 }
 
+/* 自动打开 Android 根 cgroup v2 目录 */
+static int open_root_cgroup(const char *custom_path)
+{
+    const char *candidates[] = {
+        custom_path,
+        "/sys/fs/cgroup",
+        "/dev/cg2_bpf",
+        NULL
+    };
+
+    for (int i = 0; i < 3; i++) {
+        if (!candidates[i] || candidates[i][0] == '\0')
+            continue;
+        int fd = open(candidates[i], O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            printf("[+] Opened cgroup v2 root: %s (fd=%d)\n", candidates[i], fd);
+            return fd;
+        }
+    }
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <mihomo_pid> [target_port]\n", argv[0]);
+        fprintf(stderr,
+                "Usage: %s <mihomo_pid> [target_port] [capture_udp:0|1] [capture_ipv6:0|1] [cgroup_path]\n",
+                argv[0]);
         return 1;
     }
 
-    int mihomo_pid = atoi(argv[1]);
-    int target_port = (argc >= 3) ? atoi(argv[2]) : 7891;
+    int mihomo_pid   = atoi(argv[1]);
+    int target_port  = (argc >= 3) ? atoi(argv[2]) : 7891;
+    int capture_udp  = (argc >= 4) ? (atoi(argv[3]) != 0) : 0;
+    int capture_ipv6 = (argc >= 5) ? (atoi(argv[4]) != 0) : 0;
+    const char *cg_path = (argc >= 6) ? argv[5] : NULL;
 
     struct sklookup_bpf *skel = NULL;
-    struct bpf_link *link = NULL;
+    struct bpf_link *sk_link = NULL;
+    struct bpf_link *cg_link = NULL;
     int tcp_fd = -1;
     int udp_fd = -1;
     int netns_fd = -1;
+    int cgroup_fd = -1;
     __u32 key_tcp = 0;
     __u32 key_udp = 1;
+    int ret = 1;
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
@@ -126,7 +156,7 @@ int main(int argc, char **argv)
     tcp_fd = get_mihomo_socket_fd(mihomo_pid, target_port, SOCK_STREAM);
     if (tcp_fd < 0) {
         fprintf(stderr, "[-] Could not find TCP socket on port %d in PID %d\n", target_port, mihomo_pid);
-        return 1;
+        goto cleanup;
     }
     printf("[+] Cloned TCP socket FD: %d\n", tcp_fd);
 
@@ -135,51 +165,82 @@ int main(int argc, char **argv)
     udp_fd = get_mihomo_socket_fd(mihomo_pid, target_port, SOCK_DGRAM);
     if (udp_fd < 0) {
         fprintf(stderr, "[-] Could not find UDP socket on port %d in PID %d\n", target_port, mihomo_pid);
-        close(tcp_fd);
-        return 1;
+        goto cleanup;
     }
     printf("[+] Cloned UDP socket FD: %d\n", udp_fd);
 
-    netns_fd = open("/proc/self/ns/net", O_RDONLY);
+    /* 3. 打开 netns 与 cgroup v2 句柄 */
+    netns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
     if (netns_fd < 0) {
-        perror("open netns failed");
-        close(tcp_fd);
-        close(udp_fd);
-        return 1;
-    }
-
-    printf("[+] Loading BPF skeleton...\n");
-    skel = sklookup_bpf__open_and_load();
-    if (!skel) {
-        fprintf(stderr, "[-] Failed to load BPF program\n");
+        perror("[-] open netns failed");
         goto cleanup;
     }
 
-    /* 3. 分别注册到 SOCKMAP */
+    cgroup_fd = open_root_cgroup(cg_path);
+    if (cgroup_fd < 0) {
+        perror("[-] open cgroup v2 root failed");
+        goto cleanup;
+    }
+
+    /* 4. 打开 BPF 骨架并写入只读配置参数 (.rodata) */
+    printf("[+] Opening BPF skeleton and injecting config...\n");
+    skel = sklookup_bpf__open();
+    if (!skel) {
+        fprintf(stderr, "[-] Failed to open BPF skeleton\n");
+        goto cleanup;
+    }
+
+    skel->rodata->cfg_mihomo_pid   = (__u32)mihomo_pid;
+    skel->rodata->cfg_mihomo_port  = (__u16)target_port;
+    skel->rodata->cfg_capture_udp  = (__u8)capture_udp;
+    skel->rodata->cfg_capture_ipv6 = (__u8)capture_ipv6;
+
+    /* 5. 加载并验证 BPF 程序 */
+    if (sklookup_bpf__load(skel) < 0) {
+        fprintf(stderr, "[-] Failed to load BPF skeleton\n");
+        goto cleanup;
+    }
+
+    /* 6. 注册 TCP 与 UDP 套接字到 SOCKMAP */
     int map_fd = bpf_map__fd(skel->maps.redirect_socket);
     if (bpf_map_update_elem(map_fd, &key_tcp, &tcp_fd, BPF_ANY) < 0) {
-        perror("bpf_map_update_elem (TCP) failed");
+        perror("[-] bpf_map_update_elem (TCP) failed");
         goto cleanup;
     }
     if (bpf_map_update_elem(map_fd, &key_udp, &udp_fd, BPF_ANY) < 0) {
-        perror("bpf_map_update_elem (UDP) failed");
+        perror("[-] bpf_map_update_elem (UDP) failed");
         goto cleanup;
     }
     printf("[+] Registered TCP(Key 0) & UDP(Key 1) to SOCKMAP\n");
 
-    link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
-    if (!link) {
-        fprintf(stderr, "[-] Failed to attach SK_LOOKUP: %s (errno=%d)\n", strerror(errno), errno);
+    /* 7. 挂载 cgroup/sock_create（必须在拉起流量路由前生效，确保防回环） */
+    cg_link = bpf_program__attach_cgroup(skel->progs.mark_mihomo_sock, cgroup_fd);
+    if (!cg_link) {
+        fprintf(stderr, "[-] Failed to attach cgroup/sock_create: %s (errno=%d)\n",
+                strerror(errno), errno);
+        goto cleanup;
+    }
+    printf("[+] Attached cgroup/sock_create (PID %d -> mark 0x01000000)\n", mihomo_pid);
+
+    /* 8. 挂载 netns sk_lookup */
+    sk_link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
+    if (!sk_link) {
+        fprintf(stderr, "[-] Failed to attach SK_LOOKUP: %s (errno=%d)\n",
+                strerror(errno), errno);
         goto cleanup;
     }
 
     printf("\n[+] ==========================================\n");
-    printf("[+] SK_LOOKUP is now ACTIVE!\n");
-    printf("[+] Outbound TCP -> Mihomo TCP (Port %d)\n", target_port);
-    printf("[+] Outbound UDP/53 -> Mihomo UDP TPROXY (Port %d)\n", target_port);
+    printf("[+] SK_LOOKUP & CGROUP_MARK are now ACTIVE!\n");
+    printf("[+] Mihomo PID    : %d (Bypass Mark: 0x01000000)\n", mihomo_pid);
+    printf("[+] Target Port   : %d\n", target_port);
+    printf("[+] Capture UDP   : %s\n", capture_udp ? "ALL PORTS" : "DNS (Port 53) ONLY");
+    printf("[+] Capture IPv6  : %s\n", capture_ipv6 ? "ENABLED" : "DISABLED");
     printf("[+] Press Ctrl+C to stop and detach\n");
     printf("[+] ==========================================\n\n");
+    fflush(stdout);
 
+    ret = 0;
     while (running) {
         pause();
     }
@@ -187,10 +248,14 @@ int main(int argc, char **argv)
     printf("\n[+] Detaching and cleaning up...\n");
 
 cleanup:
-    if (link)
-        bpf_link__destroy(link);
+    if (sk_link)
+        bpf_link__destroy(sk_link);
+    if (cg_link)
+        bpf_link__destroy(cg_link);
     if (skel)
         sklookup_bpf__destroy(skel);
+    if (cgroup_fd >= 0)
+        close(cgroup_fd);
     if (netns_fd >= 0)
         close(netns_fd);
     if (tcp_fd >= 0)
@@ -199,5 +264,5 @@ cleanup:
         close(udp_fd);
 
     printf("[+] Completed. Exited cleanly.\n");
-    return 0;
+    return ret;
 }

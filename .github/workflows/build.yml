@@ -2,7 +2,7 @@ name: Build sklookup
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "October-Opt" ]
   workflow_dispatch:
 
 jobs:
