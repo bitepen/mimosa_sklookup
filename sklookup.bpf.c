@@ -15,8 +15,6 @@ char LICENSE[] SEC("license") = "GPL";
  * 由用户态 sklookup 在加载前通过 skel->rodata 注入的只读配置
  * BPF 验证器会在加载期直接裁剪未启用的常量分支
  */
-const volatile __u32 cfg_mihomo_pid   = 0;
-const volatile __u32 cfg_bypass_mark  = 0x01000000;
 const volatile __u16 cfg_mihomo_port  = 7891;
 const volatile __u8  cfg_capture_udp  = 0; /* 0: 仅劫持 UDP 53, 1: 捕获全端口 UDP */
 const volatile __u8  cfg_capture_ipv6 = 0; /* 0: 忽略 IPv6,     1: 捕获 IPv6 */
@@ -32,27 +30,6 @@ struct {
     __type(value, __u32);
 } redirect_socket SEC(".maps");
 
-/*
- * 挂载点 1：cgroup/sock_create
- * 识别 Mihomo 自身进程（含所有 Go 协程线程）创建的 Socket，
- * 自动打上 0x01000000 高位 fwmark，配合 ip rule 彻底杜绝 UID 0 回环死锁
- */
-SEC("cgroup/sock_create")
-int mark_mihomo_sock(struct bpf_sock *sk)
-{
-    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-
-    if (cfg_mihomo_pid != 0 && pid == cfg_mihomo_pid) {
-        sk->mark = cfg_bypass_mark;
-    }
-
-    return 1; /* 允许创建 Socket */
-}
-
-/*
- * 挂载点 2：sk_lookup
- * 接管经由策略路由引流至 lo 的 IPv4 / IPv6 TCP 与 UDP 流量
- */
 SEC("sk_lookup")
 int sk_lookup_redirect(struct bpf_sk_lookup *ctx)
 {
