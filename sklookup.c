@@ -34,6 +34,7 @@ static void sig_handler(int sig)
     running = 0;
 }
 
+/* 支持按 target_type (SOCK_STREAM / SOCK_DGRAM) 精准克隆套接字 */
 static int get_mihomo_socket_fd(int pid, int target_port, int target_type)
 {
     int pidfd = syscall(__NR_pidfd_open, pid, 0);
@@ -99,6 +100,9 @@ static int get_mihomo_socket_fd(int pid, int target_port, int target_type)
 
 int main(int argc, char **argv)
 {
+    /* 设置 stdout 为行缓冲，确保重定向到日志文件时按真实时间顺序实时输出 */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc < 2) {
         fprintf(stderr,
                 "Usage: %s <mihomo_pid> [target_port] [capture_udp:0|1] [capture_ipv6:0|1]\n",
@@ -112,7 +116,7 @@ int main(int argc, char **argv)
     int capture_ipv6 = (argc >= 5) ? (atoi(argv[4]) != 0) : 0;
 
     struct sklookup_bpf *skel = NULL;
-    struct bpf_link *sk_link = NULL;
+    struct bpf_link *link = NULL;
     int tcp_fd = -1;
     int udp_fd = -1;
     int netns_fd = -1;
@@ -125,6 +129,7 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    /* 1. 抓取 TCP 7891 */
     printf("[+] Fetching TCP socket for port %d from PID %d...\n", target_port, mihomo_pid);
     tcp_fd = get_mihomo_socket_fd(mihomo_pid, target_port, SOCK_STREAM);
     if (tcp_fd < 0) {
@@ -133,6 +138,7 @@ int main(int argc, char **argv)
     }
     printf("[+] Cloned TCP socket FD: %d\n", tcp_fd);
 
+    /* 2. 抓取 UDP 7891 (TPROXY) */
     printf("[+] Fetching UDP socket for port %d from PID %d...\n", target_port, mihomo_pid);
     udp_fd = get_mihomo_socket_fd(mihomo_pid, target_port, SOCK_DGRAM);
     if (udp_fd < 0) {
@@ -141,12 +147,14 @@ int main(int argc, char **argv)
     }
     printf("[+] Cloned UDP socket FD: %d\n", udp_fd);
 
+    /* 3. 打开当前网络命名空间 */
     netns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
     if (netns_fd < 0) {
         perror("[-] open netns failed");
         goto cleanup;
     }
 
+    /* 4. 打开 BPF 骨架并写入只读配置参数 (.rodata) */
     printf("[+] Opening BPF skeleton and injecting config...\n");
     skel = sklookup_bpf__open();
     if (!skel) {
@@ -158,11 +166,13 @@ int main(int argc, char **argv)
     skel->rodata->cfg_capture_udp  = (__u8)capture_udp;
     skel->rodata->cfg_capture_ipv6 = (__u8)capture_ipv6;
 
+    /* 5. 加载并验证 BPF 程序 */
     if (sklookup_bpf__load(skel) < 0) {
-        fprintf(stderr, "[-] Failed to load BPF skeleton\n");
+        fprintf(stderr, "[-] Failed to load BPF program\n");
         goto cleanup;
     }
 
+    /* 6. 分别注册 TCP 与 UDP 套接字到 SOCKMAP */
     int map_fd = bpf_map__fd(skel->maps.redirect_socket);
     if (bpf_map_update_elem(map_fd, &key_tcp, &tcp_fd, BPF_ANY) < 0) {
         perror("[-] bpf_map_update_elem (TCP) failed");
@@ -174,8 +184,9 @@ int main(int argc, char **argv)
     }
     printf("[+] Registered TCP(Key 0) & UDP(Key 1) to SOCKMAP\n");
 
-    sk_link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
-    if (!sk_link) {
+    /* 7. 挂载 netns sk_lookup */
+    link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
+    if (!link) {
         fprintf(stderr, "[-] Failed to attach SK_LOOKUP: %s (errno=%d)\n",
                 strerror(errno), errno);
         goto cleanup;
@@ -188,7 +199,6 @@ int main(int argc, char **argv)
     printf("[+] Capture IPv6  : %s\n", capture_ipv6 ? "ENABLED" : "DISABLED");
     printf("[+] Press Ctrl+C to stop and detach\n");
     printf("[+] ==========================================\n\n");
-    fflush(stdout);
 
     ret = 0;
     while (running) {
@@ -198,8 +208,8 @@ int main(int argc, char **argv)
     printf("\n[+] Detaching and cleaning up...\n");
 
 cleanup:
-    if (sk_link)
-        bpf_link__destroy(sk_link);
+    if (link)
+        bpf_link__destroy(link);
     if (skel)
         sklookup_bpf__destroy(skel);
     if (netns_fd >= 0)

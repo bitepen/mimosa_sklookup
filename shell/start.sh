@@ -127,53 +127,49 @@ if [ "$BLACKLIST_ENABLE" = "true" ] && [ -f "$CONF_FILE" ] && [ -f /data/system/
     ')
 fi
 
-# 8. 构建并批量注入 IPv4 策略路由
-# DNS 劫持覆盖：0-0 (系统更新 update_engine)、2000-2000 (shell/LSPosed)、10000-99999 (普通应用)
-DNS_UID_RANGES="0-0 2000-2000 10000-99999"
-# 公网直连 IP 劫持覆盖：2000-2000 与 10000-99999（配合 7900 fwmark 双重防回环）
-APP_UID_RANGES="2000-2000 10000-99999"
+# 8. 构建并批量注入 IPv4 策略路由（单次 ip -batch 调用）
+# 仅捕获 2000-2000 (shell/LSPosed) 与 10000-99999 (普通应用)，彻底放行 UID 0/1001/1073
+TARGET_UID_RANGES="2000-2000 10000-99999"
 
 $IP_CMD route flush table 80 2>/dev/null
 {
     echo "route add local default dev lo src 127.0.0.1 table 80"
 
-    # 8.0 优先创建 9001 空操作锚点（9001: from all nop），使所有 goto 9001 立即生效
+    # 8.0 创建 9001 空操作锚点（9001: from all nop），确保所有 goto 9001 规则立即解析生效
     echo "rule add pref 9001"
 
-    # 8.1 最高优先级：放行 Mihomo 自身流量（匹配 config.yaml 的 routing-mark: 16777216）
-    echo "rule add fwmark 0x01000000/0x01000000 goto 9001 pref 7900"
-
-    # 8.2 发往 Fake-IP (198.18.0.0/16) 的 UDP 处理
+    # 8.1 发往 Fake-IP (198.18.0.0/16) 的 UDP 处理
     if [ "$UDP_MODE" = "capture" ]; then
         echo "rule add to 198.18.0.0/16 ipproto 17 lookup 80 pref 7990"
     else
         echo "rule add to 198.18.0.0/16 ipproto 17 type unreachable pref 7990"
     fi
 
-    # 8.3 劫持全机所有访问 Fake-IP 的 TCP 流量（含拿到 Fake-IP 后的 UID 0 update_engine）
+    # 8.2 劫持访问 Fake-IP 的 TCP 流量
     echo "rule add to 198.18.0.0/16 ipproto 6 lookup 80 pref 8000"
 
-    # 8.4 包名黑名单直连放行（8100~8880，排在 DNS 劫持前，让黑名单国内 App 拿真实 IP 走物理网卡）
+    # 8.3 包名黑名单直连放行（8100~8880，排在 DNS 劫持之前，让国内 App 拿真实 IP 走物理网卡）
     if [ -n "$BLACKLIST_RANGES" ]; then
         echo "$BLACKLIST_RANGES" | while read -r range pref; do
             [ -n "$range" ] && echo "rule add uidrange $range goto 9001 pref $pref"
         done
     fi
 
-    # 8.5 【防 DNS 泄露关键】在局域网放行前劫持 UDP 53（含发往路由器 192.168.x.1:53 的请求）
-    for urange in $DNS_UID_RANGES; do
+    # 8.4 【防 DNS 泄露核心】在局域网放行之前劫持 UDP 53（含发往路由器 192.168.x.1:53 的请求）
+    for urange in $TARGET_UID_RANGES; do
         echo "rule add uidrange $urange ipproto 17 dport 53 lookup 80 pref 8890"
     done
 
-    # 8.6 放行非 DNS 的局域网私网、链路本地与组播流量（保障 Quick Share / 投屏原生直连）
+    # 8.5 放行非 DNS 的局域网私网、运营商 CGNAT 内网、链路本地与组播流量
     echo "rule add to 10.0.0.0/8 goto 9001 pref 8900"
     echo "rule add to 172.16.0.0/12 goto 9001 pref 8901"
     echo "rule add to 192.168.0.0/16 goto 9001 pref 8902"
-    echo "rule add to 169.254.0.0/16 goto 9001 pref 8903"
-    echo "rule add to 224.0.0.0/4 goto 9001 pref 8904"
+    echo "rule add to 100.64.0.0/10 goto 9001 pref 8903"
+    echo "rule add to 169.254.0.0/16 goto 9001 pref 8904"
+    echo "rule add to 224.0.0.0/4 goto 9001 pref 8905"
 
-    # 8.7 捕获应用与 shell 的公网 UDP 与 TCP（8995~9000）
-    for urange in $APP_UID_RANGES; do
+    # 8.6 捕获目标区间的公网 UDP 与 TCP（8995~9000）
+    for urange in $TARGET_UID_RANGES; do
         if [ "$UDP_MODE" = "capture" ]; then
             echo "rule add uidrange $urange ipproto 17 lookup 80 pref 8995"
         elif [ "$UDP_MODE" = "block" ]; then
@@ -188,28 +184,28 @@ $IP_CMD -6 route flush table 80 2>/dev/null
 if [ "$IPV6_MODE" = "block" ]; then
     {
         echo "rule add pref 9001"
-        echo "rule add fwmark 0x01000000/0x01000000 goto 9001 pref 7900"
 
+        # 黑名单内的国内应用允许正常使用运营商原生 IPv6
         if [ -n "$BLACKLIST_RANGES" ]; then
             echo "$BLACKLIST_RANGES" | while read -r range pref; do
                 [ -n "$range" ] && echo "rule add uidrange $range goto 9001 pref $pref"
             done
         fi
 
-        for urange in $DNS_UID_RANGES; do
-            # 阻断向路由器 fe80:: 发送 IPv6 DNS 请求，强制 0ms 退回 IPv4 53 端口进 Mihomo
+        for urange in $TARGET_UID_RANGES; do
+            # 阻断应用向路由器 fe80:: 发送 IPv6 DNS 请求，强制 0ms 退回 IPv4 53 端口进 Mihomo
             echo "rule add uidrange $urange ipproto 17 dport 53 type unreachable pref 8890"
-            # 阻断公网 IPv6 (2000::/3) 直连
+            # 阻断应用公网 IPv6 (2000::/3) 直连，防真实 IP 泄露（完全不触碰 UID 0 与 1001 基带）
             echo "rule add to 2000::/3 uidrange $urange type unreachable pref 8990"
         done
     } | $IP_CMD -6 -batch - 2>> "$LOG_FILE"
 
 elif [ "$IPV6_MODE" = "capture" ]; then
     {
-        echo "route add local default dev lo table 80"
+        echo "route add local default dev lo src ::1 table 80"
         echo "rule add pref 9001"
-        echo "rule add fwmark 0x01000000/0x01000000 goto 9001 pref 7900"
 
+        # 发往 Fake-IPv6 (fc00::/18) 的流量处理
         if [ "$UDP_MODE" = "capture" ]; then
             echo "rule add to fc00::/18 ipproto 17 lookup 80 pref 7990"
         else
@@ -217,19 +213,16 @@ elif [ "$IPV6_MODE" = "capture" ]; then
         fi
         echo "rule add to fc00::/18 ipproto 6 lookup 80 pref 8000"
 
+        # 包名黑名单直连放行
         if [ -n "$BLACKLIST_RANGES" ]; then
             echo "$BLACKLIST_RANGES" | while read -r range pref; do
                 [ -n "$range" ] && echo "rule add uidrange $range goto 9001 pref $pref"
             done
         fi
 
-        for urange in $DNS_UID_RANGES; do
-            # 阻断向路由器 fe80:: 链路本地地址发送 IPv6 DNS，强制使用 IPv4 53 或公网 IPv6 DNS
-            echo "rule add to fe80::/10 uidrange $urange ipproto 17 dport 53 type unreachable pref 8885"
+        # 劫持 IPv6 UDP 53 (DNS) 与公网 2000::/3 流量
+        for urange in $TARGET_UID_RANGES; do
             echo "rule add uidrange $urange ipproto 17 dport 53 lookup 80 pref 8890"
-        done
-
-        for urange in $APP_UID_RANGES; do
             if [ "$UDP_MODE" = "capture" ]; then
                 echo "rule add to 2000::/3 uidrange $urange ipproto 17 lookup 80 pref 8995"
             elif [ "$UDP_MODE" = "block" ]; then
