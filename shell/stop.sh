@@ -10,21 +10,21 @@ else
     IP_CMD="ip"
 fi
 
-# 2. 先撤规则：一次性批量清理 pref 7900 ~ 9000 之间的所有 IPv4 策略路由
+# 2. 先撤规则：一次性批量清理 pref 7900 ~ 9001 之间的所有 IPv4 策略路由
 $IP_CMD rule show 2>/dev/null | awk -F':' '
     {
         pref = $1 + 0
-        if (pref >= 7900 && pref <= 9000) {
+        if (pref >= 7900 && pref <= 9001) {
             printf "rule del pref %d\n", pref
         }
     }
 ' | $IP_CMD -batch - 2>/dev/null
 
-# 一次性批量清理 pref 7900 ~ 9000 之间的所有 IPv6 策略路由
+# 一次性批量清理 pref 7900 ~ 9001 之间的所有 IPv6 策略路由
 $IP_CMD -6 rule show 2>/dev/null | awk -F':' '
     {
         pref = $1 + 0
-        if (pref >= 7900 && pref <= 9000) {
+        if (pref >= 7900 && pref <= 9001) {
             printf "rule del pref %d\n", pref
         }
     }
